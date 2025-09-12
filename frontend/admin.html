@@ -975,7 +975,7 @@
                     <div class="card-header">
                         <h3 class="card-title">已保存的凭证</h3>
                         <div>
-                            <button class="btn btn-secondary" onclick="resumeAutoRotation()" style="margin-right: 0.5rem;">
+                            <button id="rotationToggleBtn" class="btn btn-secondary" onclick="toggleAutoRotation()" style="margin-right: 0.5rem;">
                                 <i class="fas fa-ban"></i> 恢复自动轮换
                             </button>
                             <button class="btn btn-primary" onclick="loadCredentials()">
@@ -1436,15 +1436,30 @@
                         </div>
                     `;
                     break;
-                case 'rotation_disabled':
+                case 'auto_rotation_disabled':
                     statusClass = 'status-warning';
                     statusIcon = 'fas fa-pause';
                     statusHtml = `
                         <div class="status ${statusClass}">
-                            <i class="${statusIcon}"></i> 轮换已关闭
+                            <i class="${statusIcon}"></i> 自动轮换已关闭
                         </div>
                         <div style="margin-top: 0.5rem; font-size: 0.9rem;">
                             固定使用: <strong>${data.filename}</strong> (凭证 #${data.index + 1})
+                            <br>轮换次数: ${data.rotation_count}
+                            ${data.user_id !== 'unknown' ? `<br>用户ID: ${data.user_id}` : ''}
+                        </div>
+                    `;
+                    break;
+                case 'rotation_count_zero':
+                    statusClass = 'status-warning';
+                    statusIcon = 'fas fa-ban';
+                    statusHtml = `
+                        <div class="status ${statusClass}">
+                            <i class="${statusIcon}"></i> 轮换次数为0
+                        </div>
+                        <div style="margin-top: 0.5rem; font-size: 0.9rem;">
+                            固定使用: <strong>${data.filename}</strong> (凭证 #${data.index + 1})
+                            <br>轮换次数设为0，不进行轮换
                             ${data.user_id !== 'unknown' ? `<br>用户ID: ${data.user_id}` : ''}
                         </div>
                     `;
@@ -1480,6 +1495,9 @@
             }
 
             statusDiv.innerHTML = statusHtml;
+            
+            // 更新按钮状态
+            updateRotationToggleButton(data);
         }
 
         function displayCredentials() {
@@ -1682,6 +1700,88 @@
             }
         }
 
+        function updateRotationToggleButton(data) {
+            const btn = document.getElementById('rotationToggleBtn');
+            if (!btn) return;
+            
+            // 根据当前状态更新按钮文本和图标
+            if (data.status === 'manual_selected') {
+                // 手动选择模式，显示恢复自动轮换按钮
+                btn.innerHTML = '<i class="fas fa-undo"></i> 恢复自动轮换';
+                btn.className = 'btn btn-secondary';
+            } else if (data.auto_rotation_enabled === false) {
+                // 自动轮换已关闭，显示开启按钮
+                btn.innerHTML = '<i class="fas fa-play"></i> 开启自动轮换';
+                btn.className = 'btn btn-success';
+            } else if (data.auto_rotation_enabled === true) {
+                // 自动轮换已开启，显示关闭按钮
+                btn.innerHTML = '<i class="fas fa-pause"></i> 关闭自动轮换';
+                btn.className = 'btn btn-warning';
+            } else {
+                // 默认状态
+                btn.innerHTML = '<i class="fas fa-undo"></i> 恢复自动轮换';
+                btn.className = 'btn btn-secondary';
+            }
+        }
+
+        async function toggleAutoRotation() {
+            const btn = document.getElementById('rotationToggleBtn');
+            const originalHtml = btn.innerHTML;
+            
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 处理中...';
+            
+            try {
+                // 先获取当前状态
+                const statusResponse = await fetch('/codebuddy/v1/credentials/current', {
+                    headers: getAuthHeaders()
+                });
+                
+                if (!statusResponse.ok) {
+                    throw new Error('无法获取当前状态');
+                }
+                
+                const statusData = await statusResponse.json();
+                
+                if (statusData.status === 'manual_selected') {
+                    // 如果是手动选择状态，先清除手动选择
+                    const response = await fetch('/codebuddy/v1/credentials/auto', {
+                        method: 'POST',
+                        headers: getAuthHeaders()
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        showNotification(`✓ ${data.message}`, 'success');
+                    } else {
+                        throw new Error('恢复自动轮换失败');
+                    }
+                } else {
+                    // 否则切换自动轮换开关
+                    const response = await fetch('/codebuddy/v1/credentials/toggle-rotation', {
+                        method: 'POST',
+                        headers: getAuthHeaders()
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        showNotification(`✓ ${data.message}`, 'success');
+                    } else {
+                        throw new Error('切换自动轮换失败');
+                    }
+                }
+                
+                // 刷新状态显示
+                loadCurrentCredentialStatus();
+                
+            } catch (error) {
+                showNotification(`操作失败: ${error.message}`, 'error');
+                btn.innerHTML = originalHtml;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+        
         async function resumeAutoRotation() {
             showNotification('正在恢复自动轮换...', 'info');
             

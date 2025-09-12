@@ -25,6 +25,7 @@ class CodeBuddyTokenManager:
         self.current_index = 0  # Start from the first credential
         self.usage_count = 0    # Counter for the current credential usage
         self.manual_selected_index = None  # 手动选择的凭证索引
+        self.auto_rotation_enabled = True  # 自动轮换开关，默认开启
         self.load_all_tokens()
     
     def load_all_tokens(self):
@@ -132,15 +133,21 @@ class CodeBuddyTokenManager:
             self.current_index = current_valid_indices[0]
             self.usage_count = 0
         
-        # 如果轮换次数设置为0，关闭轮换，只使用当前凭证
-        if rotation_count == 0:
+        # 检查是否需要轮换：需要同时满足自动轮换开启 且 轮换次数大于0
+        should_rotate = self.auto_rotation_enabled and rotation_count > 0
+        
+        if not should_rotate:
+            # 不轮换：固定使用当前凭证
             credential = self.credentials[self.current_index]
             credential_filename = os.path.basename(credential['file_path'])
             usage_stats_manager.record_credential_usage(credential_filename)
-            logger.info(f"Using fixed credential (rotation disabled): {credential_filename}")
+            if rotation_count == 0:
+                logger.info(f"Using fixed credential (rotation count is 0): {credential_filename}")
+            else:
+                logger.info(f"Using fixed credential (auto rotation disabled): {credential_filename}")
             return credential['data']
 
-        # 正常轮换逻辑
+        # 自动轮换逻辑：当开关开启且轮换次数>0时
         if self.usage_count >= rotation_count:
             # 轮换到下一个有效凭证
             next_valid_position = (current_valid_position + 1) % len(valid_credentials)
@@ -298,6 +305,23 @@ class CodeBuddyTokenManager:
         self.manual_selected_index = None
         logger.info("Cleared manual credential selection, resumed automatic rotation")
     
+    def enable_auto_rotation(self):
+        """开启自动轮换"""
+        self.auto_rotation_enabled = True
+        logger.info("Auto rotation enabled")
+    
+    def disable_auto_rotation(self):
+        """关闭自动轮换"""
+        self.auto_rotation_enabled = False
+        logger.info("Auto rotation disabled")
+    
+    def toggle_auto_rotation(self):
+        """切换自动轮换状态"""
+        self.auto_rotation_enabled = not self.auto_rotation_enabled
+        status = "enabled" if self.auto_rotation_enabled else "disabled"
+        logger.info(f"Auto rotation toggled: {status}")
+        return self.auto_rotation_enabled
+    
     def get_current_credential_info(self) -> Dict:
         """获取当前使用的凭证信息"""
         from config import get_rotation_count
@@ -315,13 +339,25 @@ class CodeBuddyTokenManager:
                 "filename": os.path.basename(credential['file_path']),
                 "user_id": credential['data'].get('user_id', 'unknown')
             }
+        elif not self.auto_rotation_enabled:
+            credential = self.credentials[self.current_index]
+            return {
+                "status": "auto_rotation_disabled",
+                "index": self.current_index,
+                "filename": os.path.basename(credential['file_path']),
+                "user_id": credential['data'].get('user_id', 'unknown'),
+                "rotation_count": rotation_count,
+                "auto_rotation_enabled": False
+            }
         elif rotation_count == 0:
             credential = self.credentials[self.current_index]
             return {
-                "status": "rotation_disabled",
+                "status": "rotation_count_zero",
                 "index": self.current_index,
                 "filename": os.path.basename(credential['file_path']),
-                "user_id": credential['data'].get('user_id', 'unknown')
+                "user_id": credential['data'].get('user_id', 'unknown'),
+                "rotation_count": rotation_count,
+                "auto_rotation_enabled": True
             }
         else:
             credential = self.credentials[self.current_index]
@@ -331,7 +367,8 @@ class CodeBuddyTokenManager:
                 "filename": os.path.basename(credential['file_path']),
                 "user_id": credential['data'].get('user_id', 'unknown'),
                 "usage_count": self.usage_count,
-                "rotation_count": rotation_count
+                "rotation_count": rotation_count,
+                "auto_rotation_enabled": True
             }
 
 

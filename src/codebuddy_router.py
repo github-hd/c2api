@@ -164,7 +164,6 @@ async def chat_completions(
                                 
                                 # 检查是否包含结束标记
                                 if b'[DONE]' in chunk:
-                                    logger.info(f"[STREAM] 在chunk {chunk_count}中发现[DONE]标记")
                                     done_found = True
                                     # 不要在这里break，让流自然结束
                         
@@ -233,7 +232,6 @@ async def chat_completions(
                     last_usage = None
                     last_system_fp = None
                     saw_any = False
-                    logger.info("[AGG] enter non-stream aggregation")
 
                     async for _chunk in response.aiter_bytes():
                         if not _chunk:
@@ -287,7 +285,6 @@ async def chat_completions(
                                         })
                                         _pos = len(tool_calls) - 1
                                         active_pos_by_index[_idx] = _pos
-                                        logger.info(f"[AGG] start tool_call index={_idx} id={_incoming_id} name={(_tc.get('function') or {}).get('name','')}")
                                     # Merge updates into active call
                                     if _incoming_id and not tool_calls[_pos].get('id'):
                                         tool_calls[_pos]['id'] = _incoming_id
@@ -329,12 +326,9 @@ async def chat_completions(
                             try:
                                 json.loads(_args)
                             except Exception as _ve:
-                                _preview = _args[:200].replace('\n', ' ')
-                                logger.warning(f"[AGG_VALIDATE] tool_calls[{_i}] arguments not valid JSON: {_ve}; preview={_preview}")
-                        else:
-                            logger.debug(f"[AGG_VALIDATE] tool_calls[{_i}] has empty arguments")
+                                pass
             except Exception as _e:
-                logger.warning(f"[AGG_VALIDATE] validation step error: {_e}")
+                pass
             _final_response = {
                 "id": agg_id or str(uuid.uuid4()),
                 "object": "chat.completion",
@@ -353,11 +347,6 @@ async def chat_completions(
                 _final_response["usage"] = last_usage
             if last_system_fp:
                 _final_response["system_fingerprint"] = last_system_fp
-            try:
-                _tc_count = len(tool_calls)
-            except Exception:
-                _tc_count = 0
-            logger.info(f"[AGG] finalize id={agg_id} model={agg_model} content_len={len(agg_content)} tool_calls={_tc_count} finish_reason={_finish_reason}")
             return _final_response
             
             # 收集所有流式响应块
@@ -613,6 +602,23 @@ async def resume_auto_rotation(_token: str = Depends(authenticate)):
 
     except Exception as e:
         logger.error(f"恢复自动轮换失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/v1/credentials/toggle-rotation", summary="Toggle automatic credential rotation")
+async def toggle_auto_rotation(_token: str = Depends(authenticate)):
+    """切换自动轮换开关"""
+    try:
+        is_enabled = codebuddy_token_manager.toggle_auto_rotation()
+        status = "enabled" if is_enabled else "disabled"
+        message = f"Auto rotation {status}"
+        return {
+            "message": message,
+            "auto_rotation_enabled": is_enabled
+        }
+
+    except Exception as e:
+        logger.error(f"切换自动轮换失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
