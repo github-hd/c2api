@@ -4,7 +4,6 @@ CodeBuddy API Router - 兼容CodeBuddy官方API格式
 import json
 import time
 import uuid
-import secrets
 import logging
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, Depends, Request, Header
@@ -19,13 +18,6 @@ from .usage_stats_manager import usage_stats_manager
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# --- CodeBuddy V1 API Models ---
-
-class CodeBuddyMessage(BaseModel):
-    role: str
-    content: Any  # 可以是字符串或复杂对象
-
 
 # --- API Endpoints ---
 
@@ -48,7 +40,6 @@ async def chat_completions(
         except Exception as e:
             logger.error(f"解析请求体失败: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {str(e)}")
-
         
         # 获取CodeBuddy凭证
         credential = codebuddy_token_manager.get_next_credential()
@@ -112,11 +103,9 @@ async def chat_completions(
                     if isinstance(item, dict) and item.get("type") == "text":
                         item["text"] = apply_keyword_replacement(item.get("text", ""))
         
-        
         # 检查客户端是否期望流式响应
         client_wants_stream = request_body.get("stream", False)
         
-
         # 发送请求到CodeBuddy
         import httpx
         
@@ -130,7 +119,6 @@ async def chat_completions(
                         verify=False, 
                         timeout=httpx.Timeout(300.0, connect=30.0, read=300.0)
                     )
-                    
                     
                     # 使用stream方法确保连接在整个过程中保持活跃
                     async with client.stream(
@@ -152,20 +140,31 @@ async def chat_completions(
                         total_bytes = 0
                         done_found = False
                         
-                        # 使用 aiter_bytes 逐块读取，确保连接保持活跃
+                        # 使用缓冲区逐行处理，确保SSE事件完整性
+                        buffer = b""
                         async for chunk in response.aiter_bytes(chunk_size=8192):
                             if chunk:
                                 chunk_count += 1
                                 total_bytes += len(chunk)
                                 
+                                # 将chunk添加到缓冲区
+                                buffer += chunk
                                 
-                                # 立即转发数据块给客户端
-                                yield chunk
-                                
-                                # 检查是否包含结束标记
-                                if b'[DONE]' in chunk:
-                                    done_found = True
-                                    # 不要在这里break，让流自然结束
+                                # 按行分割处理，确保SSE事件的完整性
+                                while b'\n' in buffer:
+                                    line, buffer = buffer.split(b'\n', 1)
+                                    line_with_newline = line + b'\n'
+                                    
+                                    # 立即转发完整的行给客户端
+                                    yield line_with_newline
+                                    
+                                    # 检查是否包含结束标记
+                                    if b'[DONE]' in line:
+                                        done_found = True
+                        
+                        # 处理缓冲区中剩余的数据
+                        if buffer:
+                            yield buffer
                         
                         if not done_found:
                             logger.warning("[STREAM] 流结束但未发现[DONE]标记")
@@ -316,19 +315,35 @@ async def chat_completions(
                 _final_message["tool_calls"] = tool_calls
             _finish_reason = "tool_calls" if tool_calls else (last_finish_reason or "stop")
 
-            # Validate tool_calls.function.arguments JSON (log only, no mutation)
-            try:
-                if tool_calls:
-                    for _i, _tc in enumerate(tool_calls):
-                        _func = _tc.get('function') or {}
-                        _args = _func.get('arguments')
-                        if isinstance(_args, str) and _args.strip():
+            # Validate and fix tool_calls.function.arguments JSON
+            if tool_calls:
+                for _i, _tc in enumerate(tool_calls):
+                    _func = _tc.get('function') or {}
+                    _args = _func.get('arguments', '')
+                    if isinstance(_args, str) and _args.strip():
+                        try:
+                            # 尝试解析JSON以验证格式
+                            json.loads(_args)
+                        except json.JSONDecodeError as _ve:
+                            # 如果JSON无效，尝试修复常见问题
+                            logger.warning(f"Tool call {_i} has invalid JSON arguments: {_ve}")
+                            
+                            # 尝试修复截断的JSON
+                            if not _args.endswith('}') and not _args.endswith(']'):
+                                if _args.count('{') > _args.count('}'):
+                                    _args += '}'
+                                elif _args.count('[') > _args.count(']'):
+                                    _args += ']'
+                            
+                            # 再次尝试解析
                             try:
                                 json.loads(_args)
-                            except Exception as _ve:
-                                pass
-            except Exception as _e:
-                pass
+                                _tc['function']['arguments'] = _args
+                                logger.info(f"Successfully fixed tool call {_i} JSON")
+                            except:
+                                # 如果仍然无法解析，使用空对象
+                                logger.error(f"Could not fix tool call {_i}, using empty args")
+                                _tc['function']['arguments'] = '{}'
             _final_response = {
                 "id": agg_id or str(uuid.uuid4()),
                 "object": "chat.completion",
@@ -348,99 +363,6 @@ async def chat_completions(
             if last_system_fp:
                 _final_response["system_fingerprint"] = last_system_fp
             return _final_response
-            
-            # 收集所有流式响应块
-            async for chunk in response.aiter_bytes():
-                if chunk:
-                    chunk_str = chunk.decode('utf-8')
-                    for line in chunk_str.split('\n'):
-                        if line.startswith('data: ') and not line.endswith('[DONE]'):
-                            try:
-                                data_str = line[6:]  # 移除 'data: ' 前缀
-                                chunk_data = json.loads(data_str)
-                                
-                                # 收集所有有效的响应块
-                                if "choices" in chunk_data:
-                                    all_chunks.append(chunk_data)
-                                    
-                            except json.JSONDecodeError:
-                                continue
-            
-            # 如果有响应块，合并为非流式格式
-            if all_chunks:
-                # 使用第一个块作为基础
-                base_response = all_chunks[0].copy()
-                base_response["object"] = "chat.completion"
-                base_response["created"] = int(time.time())
-                
-                # 合并所有块的内容
-                if "choices" in base_response and base_response["choices"]:
-                    choice = base_response["choices"][0]
-                    
-                    # 如果第一个块就有完整的delta，直接转换
-                    if "delta" in choice:
-                        # 合并所有块的delta内容
-                        merged_delta = choice["delta"].copy()
-                        
-                        
-                        # 合并所有块的内容（包括第一个块）
-                        merged_content = merged_delta.get("content", "") or ""
-                        merged_tool_calls = {}  # 使用字典按index组织
-                        
-                        # 处理所有块（包括第一个）
-                        for chunk in all_chunks:
-                            if "choices" in chunk and chunk["choices"]:
-                                delta = chunk["choices"][0].get("delta", {})
-                                if "content" in delta and delta["content"]:
-                                    merged_content += delta["content"]
-                                if "tool_calls" in delta:
-                                    # 合并工具调用参数
-                                    for new_tool_call in delta["tool_calls"]:
-                                        if new_tool_call.get("index") is not None:
-                                            index = new_tool_call["index"]
-                                            
-                                            # 初始化工具调用槽位
-                                            if index not in merged_tool_calls:
-                                                merged_tool_calls[index] = {
-                                                    "index": index,
-                                                    "function": {"name": "", "arguments": ""}
-                                                }
-                                            
-                                            # 合并工具调用信息
-                                            if "function" in new_tool_call:
-                                                # 合并参数字符串
-                                                if "arguments" in new_tool_call["function"]:
-                                                    merged_tool_calls[index]["function"]["arguments"] += new_tool_call["function"]["arguments"]
-                                                
-                                                # 设置工具名称（保留非空值）
-                                                if "name" in new_tool_call["function"] and new_tool_call["function"]["name"]:
-                                                    merged_tool_calls[index]["function"]["name"] = new_tool_call["function"]["name"]
-                                            
-                                            # 更新其他字段（id, type等）
-                                            for key, value in new_tool_call.items():
-                                                if key not in ["function", "index"]:
-                                                    merged_tool_calls[index][key] = value
-                        
-                        # 转换为数组格式
-                        merged_delta["content"] = merged_content
-                        if merged_tool_calls:
-                            merged_delta["tool_calls"] = list(merged_tool_calls.values())
-                        
-                        # 转换delta为message
-                        choice["message"] = merged_delta
-                        choice["message"]["role"] = choice["message"].get("role", "assistant")
-                        choice["finish_reason"] = "stop"
-                        if 'delta' in choice:
-                            del choice["delta"]
-                        
-                
-                return base_response
-            else:
-                # 如果没有收到有效响应，返回错误
-                return {
-                    "error": "No valid response received from CodeBuddy",
-                    "details": "Stream ended without complete response"
-                }
                 
     except HTTPException:
         raise

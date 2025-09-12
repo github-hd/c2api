@@ -166,3 +166,4 @@ logs/
 # Backup files
 *.bak
 *.backup
+.claude/settings.local.json
