@@ -125,33 +125,6 @@ async def chat_completions(
                         item["text"] = apply_keyword_replacement(item.get("text", ""))
         
         
-        # 发送请求到CodeBuddy
-        import httpx
-        try:
-            async with httpx.AsyncClient(verify=False, timeout=300) as client:  # 增加超时时间
-                response = await client.post(
-                    "https://www.codebuddy.ai/v2/chat/completions",
-                    json=payload,
-                    headers=headers
-                )
-                
-                if response.status_code != 200:
-                    error_text = response.text
-                    logger.error(f"CodeBuddy API错误: {response.status_code} - {error_text}")
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"CodeBuddy API error: {error_text}"
-                    )
-        except httpx.TimeoutException:
-            logger.error("CodeBuddy API 超时")
-            raise HTTPException(status_code=504, detail="CodeBuddy API timeout")
-        except httpx.NetworkError as e:
-            logger.error(f"网络错误: {e}")
-            raise HTTPException(status_code=502, detail=f"Network error: {str(e)}")
-        except Exception as e:
-            logger.error(f"请求异常: {e}")
-            raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
-        
         # 检查客户端是否期望流式响应
         client_wants_stream = request_body.get("stream", False)
         
@@ -160,110 +133,208 @@ async def chat_completions(
         except Exception:
             pass
 
+        # 发送请求到CodeBuddy
+        import httpx
+        
         if client_wants_stream:
-            # 客户端要求流式，直接透传
+            # 流式响应：使用httpx.stream确保连接保持活跃
             async def stream_response():
+                client = None
                 try:
-                    async for chunk in response.aiter_bytes():
-                        if chunk:
-                            yield chunk
+                    # 创建客户端连接，使用合适的超时设置
+                    client = httpx.AsyncClient(
+                        verify=False, 
+                        timeout=httpx.Timeout(300.0, connect=30.0, read=300.0)
+                    )
+                    
+                    logger.info("[STREAM] 开始向CodeBuddy发起流式请求")
+                    
+                    # 使用stream方法确保连接在整个过程中保持活跃
+                    async with client.stream(
+                        "POST", 
+                        "https://www.codebuddy.ai/v2/chat/completions",
+                        json=payload,
+                        headers=headers
+                    ) as response:
+                        
+                        if response.status_code != 200:
+                            error_text = await response.aread()
+                            error_msg = error_text.decode('utf-8', errors='ignore')
+                            logger.error(f"CodeBuddy API错误: {response.status_code} - {error_msg}")
+                            error_chunk = f'data: {{"error": "CodeBuddy API error: {response.status_code} - {error_msg}"}}\n\n'
+                            yield error_chunk.encode('utf-8')
+                            return
+                        
+                        logger.info("[STREAM] CodeBuddy响应状态正常，开始读取流式数据")
+                        chunk_count = 0
+                        total_bytes = 0
+                        done_found = False
+                        
+                        # 使用 aiter_bytes 逐块读取，确保连接保持活跃
+                        async for chunk in response.aiter_bytes(chunk_size=8192):
+                            if chunk:
+                                chunk_count += 1
+                                total_bytes += len(chunk)
+                                
+                                # 记录详细的chunk信息用于调试
+                                chunk_text = chunk.decode('utf-8', errors='ignore')
+                                logger.debug(f"[STREAM] chunk {chunk_count}: size={len(chunk)}")
+                                logger.debug(f"[STREAM] chunk content preview: {chunk_text[:200]}...")
+                                
+                                # 立即转发数据块给客户端
+                                yield chunk
+                                
+                                # 检查是否包含结束标记
+                                if b'[DONE]' in chunk:
+                                    logger.info(f"[STREAM] 在chunk {chunk_count}中发现[DONE]标记")
+                                    done_found = True
+                                    # 不要在这里break，让流自然结束
+                        
+                        if not done_found:
+                            logger.warning("[STREAM] 流结束但未发现[DONE]标记")
+                        else:
+                            logger.info(f"[STREAM] 流式传输成功完成: chunks={chunk_count}, total_bytes={total_bytes}")
+                                
+                except httpx.TimeoutException as e:
+                    logger.error(f"CodeBuddy API 超时: {e}")
+                    error_chunk = f'data: {{"error": "CodeBuddy API timeout: {str(e)}"}}\n\n'
+                    yield error_chunk.encode('utf-8')
+                except httpx.NetworkError as e:
+                    logger.error(f"网络错误: {e}")
+                    error_chunk = f'data: {{"error": "Network error: {str(e)}"}}\n\n'
+                    yield error_chunk.encode('utf-8')
                 except Exception as e:
-                    logger.error(f"流式响应错误: {e}")
+                    logger.error(f"流式响应错误: {e}", exc_info=True)
                     error_chunk = f'data: {{"error": "Stream interrupted: {str(e)}"}}\n\n'
                     yield error_chunk.encode('utf-8')
+                finally:
+                    # 确保客户端连接被正确关闭
+                    if client:
+                        await client.aclose()
+                        logger.debug("[STREAM] httpx客户端连接已关闭")
             
             return StreamingResponse(
                 stream_response(),
                 media_type="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache",
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                    "Access-Control-Allow-Headers": "*"
+                    "Access-Control-Allow-Headers": "*",
+                    "Content-Type": "text/event-stream; charset=utf-8",
+                    "Transfer-Encoding": "chunked"
                 }
             )
         else:
             # 客户端要求非流式，收集并合并所有流式响应块（真正透传）
             # Rewritten: aggregate SSE chunks into a single non-stream response (minimal + complete)
-            agg_id = None
-            agg_model = None
-            agg_content = ""
-            # Maintain ordered list of tool calls + active mapping by index
-            tool_calls: List[Dict[str, Any]] = []
-            active_pos_by_index: Dict[int, int] = {}
-            last_finish_reason = None
-            last_usage = None
-            last_system_fp = None
-            saw_any = False
-            logger.info("[AGG] enter non-stream aggregation")
+            try:
+                async with httpx.AsyncClient(verify=False, timeout=300) as client:
+                    response = await client.post(
+                        "https://www.codebuddy.ai/v2/chat/completions",
+                        json=payload,
+                        headers=headers
+                    )
+                    
+                    if response.status_code != 200:
+                        error_text = response.text
+                        logger.error(f"CodeBuddy API错误: {response.status_code} - {error_text}")
+                        raise HTTPException(
+                            status_code=response.status_code,
+                            detail=f"CodeBuddy API error: {error_text}"
+                        )
+                    
+                    agg_id = None
+                    agg_model = None
+                    agg_content = ""
+                    # Maintain ordered list of tool calls + active mapping by index
+                    tool_calls: List[Dict[str, Any]] = []
+                    active_pos_by_index: Dict[int, int] = {}
+                    last_finish_reason = None
+                    last_usage = None
+                    last_system_fp = None
+                    saw_any = False
+                    logger.info("[AGG] enter non-stream aggregation")
 
-            async for _chunk in response.aiter_bytes():
-                if not _chunk:
-                    continue
-                _s = _chunk.decode('utf-8', errors='ignore')
-                for _line in _s.split('\n'):
-                    if not _line.startswith('data: '):
-                        continue
-                    _data = _line[6:].strip()
-                    if not _data or _data == '[DONE]':
-                        continue
-                    try:
-                        _obj = json.loads(_data)
-                    except json.JSONDecodeError:
-                        continue
-
-                    saw_any = True
-                    agg_id = agg_id or _obj.get('id')
-                    agg_model = agg_model or _obj.get('model')
-                    last_system_fp = _obj.get('system_fingerprint') or last_system_fp
-                    if _obj.get('usage'):
-                        last_usage = _obj.get('usage')
-
-                    _choices = _obj.get('choices') or []
-                    if not _choices:
-                        continue
-                    _c0 = _choices[0]
-                    _fr = _c0.get('finish_reason')
-                    if _fr:
-                        last_finish_reason = _fr
-                    _delta = _c0.get('delta') or {}
-                    _text_piece = _delta.get('content')
-                    if _text_piece:
-                        agg_content += _text_piece
-                    _tc_list = _delta.get('tool_calls')
-                    if isinstance(_tc_list, list):
-                        for _tc in _tc_list:
-                            if not isinstance(_tc, dict):
+                    async for _chunk in response.aiter_bytes():
+                        if not _chunk:
+                            continue
+                        _s = _chunk.decode('utf-8', errors='ignore')
+                        for _line in _s.split('\n'):
+                            if not _line.startswith('data: '):
                                 continue
-                            _idx = _tc.get('index')
-                            if _idx is None:
+                            _data = _line[6:].strip()
+                            if not _data or _data == '[DONE]':
                                 continue
-                            _incoming_id = _tc.get('id')
-                            _pos = active_pos_by_index.get(_idx)
-                            # Start a new call when first seen for this index or id changes
-                            if _pos is None or (_incoming_id and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
-                                tool_calls.append({
-                                    'id': _incoming_id,
-                                    'type': _tc.get('type', 'function'),
-                                    'function': {'name': (_tc.get('function') or {}).get('name', ''), 'arguments': ''}
-                                })
-                                _pos = len(tool_calls) - 1
-                                active_pos_by_index[_idx] = _pos
-                                logger.info(f"[AGG] start tool_call index={_idx} id={_incoming_id} name={(_tc.get('function') or {}).get('name','')}")
-                            # Merge updates into active call
-                            if _incoming_id and not tool_calls[_pos].get('id'):
-                                tool_calls[_pos]['id'] = _incoming_id
-                            if _tc.get('type'):
-                                tool_calls[_pos]['type'] = _tc.get('type')
-                            _func = _tc.get('function') or {}
-                            _name = _func.get('name')
-                            if _name:
-                                tool_calls[_pos]['function']['name'] = _name
-                            _args_piece = _func.get('arguments')
-                            if _args_piece:
-                                tool_calls[_pos]['function']['arguments'] += _args_piece
+                            try:
+                                _obj = json.loads(_data)
+                            except json.JSONDecodeError:
+                                continue
+
+                            saw_any = True
+                            agg_id = agg_id or _obj.get('id')
+                            agg_model = agg_model or _obj.get('model')
+                            last_system_fp = _obj.get('system_fingerprint') or last_system_fp
+                            if _obj.get('usage'):
+                                last_usage = _obj.get('usage')
+
+                            _choices = _obj.get('choices') or []
+                            if not _choices:
+                                continue
+                            _c0 = _choices[0]
+                            _fr = _c0.get('finish_reason')
+                            if _fr:
+                                last_finish_reason = _fr
+                            _delta = _c0.get('delta') or {}
+                            _text_piece = _delta.get('content')
+                            if _text_piece:
+                                agg_content += _text_piece
+                            _tc_list = _delta.get('tool_calls')
+                            if isinstance(_tc_list, list):
+                                for _tc in _tc_list:
+                                    if not isinstance(_tc, dict):
+                                        continue
+                                    _idx = _tc.get('index')
+                                    if _idx is None:
+                                        continue
+                                    _incoming_id = _tc.get('id')
+                                    _pos = active_pos_by_index.get(_idx)
+                                    # Start a new call when first seen for this index or id changes
+                                    if _pos is None or (_incoming_id and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
+                                        tool_calls.append({
+                                            'id': _incoming_id,
+                                            'type': _tc.get('type', 'function'),
+                                            'function': {'name': (_tc.get('function') or {}).get('name', ''), 'arguments': ''}
+                                        })
+                                        _pos = len(tool_calls) - 1
+                                        active_pos_by_index[_idx] = _pos
+                                        logger.info(f"[AGG] start tool_call index={_idx} id={_incoming_id} name={(_tc.get('function') or {}).get('name','')}")
+                                    # Merge updates into active call
+                                    if _incoming_id and not tool_calls[_pos].get('id'):
+                                        tool_calls[_pos]['id'] = _incoming_id
+                                    if _tc.get('type'):
+                                        tool_calls[_pos]['type'] = _tc.get('type')
+                                    _func = _tc.get('function') or {}
+                                    _name = _func.get('name')
+                                    if _name:
+                                        tool_calls[_pos]['function']['name'] = _name
+                                    _args_piece = _func.get('arguments')
+                                    if _args_piece:
+                                        tool_calls[_pos]['function']['arguments'] += _args_piece
+
+            except httpx.TimeoutException:
+                logger.error("CodeBuddy API 超时")
+                raise HTTPException(status_code=504, detail="CodeBuddy API timeout")
+            except httpx.NetworkError as e:
+                logger.error(f"网络错误: {e}")
+                raise HTTPException(status_code=502, detail=f"Network error: {str(e)}")
+            except Exception as e:
+                logger.error(f"请求异常: {e}")
+                raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
 
             if not saw_any:
                 return {"error": "No valid response received from CodeBuddy", "details": "Stream ended without complete response"}
@@ -313,9 +384,6 @@ async def chat_completions(
                 _tc_count = 0
             logger.info(f"[AGG] finalize id={agg_id} model={agg_model} content_len={len(agg_content)} tool_calls={_tc_count} finish_reason={_finish_reason}")
             return _final_response
-
-            # Unreachable legacy aggregation below (kept for reference)
-            all_chunks = []
             
             # 收集所有流式响应块
             async for chunk in response.aiter_bytes():
