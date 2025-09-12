@@ -49,12 +49,6 @@ async def chat_completions(
             logger.error(f"解析请求体失败: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {str(e)}")
 
-        # Log client stream preference for this request
-        try:
-            client_wants_stream = bool(request_body.get("stream", False))
-            logger.info(f"[REQ] /v1/chat/completions client_stream={client_wants_stream} model={request_body.get('model')}")
-        except Exception:
-            client_wants_stream = False
         
         # 获取CodeBuddy凭证
         credential = codebuddy_token_manager.get_next_credential()
@@ -87,12 +81,6 @@ async def chat_completions(
         payload["stream"] = True  # CodeBuddy 只支持流式请求
         
         # 处理消息长度要求：CodeBuddy要求至少2条消息
-        try:
-            logger.info(
-                f"[ROUTE] client_stream={client_wants_stream} -> upstream_stream=True model={payload.get('model')} conv_id={headers.get('X-Conversation-ID')} req_id={headers.get('X-Request-ID')}"
-            )
-        except Exception:
-            pass
         messages = payload.get("messages", [])
         if len(messages) == 1 and messages[0].get("role") == "user":
             # 添加系统消息
@@ -128,10 +116,6 @@ async def chat_completions(
         # 检查客户端是否期望流式响应
         client_wants_stream = request_body.get("stream", False)
         
-        try:
-            logger.info(f"[ROUTE] selected_path={'stream' if client_wants_stream else 'non-stream-aggregate'}")
-        except Exception:
-            pass
 
         # 发送请求到CodeBuddy
         import httpx
@@ -147,7 +131,6 @@ async def chat_completions(
                         timeout=httpx.Timeout(300.0, connect=30.0, read=300.0)
                     )
                     
-                    logger.info("[STREAM] 开始向CodeBuddy发起流式请求")
                     
                     # 使用stream方法确保连接在整个过程中保持活跃
                     async with client.stream(
@@ -165,7 +148,6 @@ async def chat_completions(
                             yield error_chunk.encode('utf-8')
                             return
                         
-                        logger.info("[STREAM] CodeBuddy响应状态正常，开始读取流式数据")
                         chunk_count = 0
                         total_bytes = 0
                         done_found = False
@@ -176,10 +158,6 @@ async def chat_completions(
                                 chunk_count += 1
                                 total_bytes += len(chunk)
                                 
-                                # 记录详细的chunk信息用于调试
-                                chunk_text = chunk.decode('utf-8', errors='ignore')
-                                logger.debug(f"[STREAM] chunk {chunk_count}: size={len(chunk)}")
-                                logger.debug(f"[STREAM] chunk content preview: {chunk_text[:200]}...")
                                 
                                 # 立即转发数据块给客户端
                                 yield chunk
@@ -192,8 +170,6 @@ async def chat_completions(
                         
                         if not done_found:
                             logger.warning("[STREAM] 流结束但未发现[DONE]标记")
-                        else:
-                            logger.info(f"[STREAM] 流式传输成功完成: chunks={chunk_count}, total_bytes={total_bytes}")
                                 
                 except httpx.TimeoutException as e:
                     logger.error(f"CodeBuddy API 超时: {e}")
@@ -211,7 +187,6 @@ async def chat_completions(
                     # 确保客户端连接被正确关闭
                     if client:
                         await client.aclose()
-                        logger.debug("[STREAM] httpx客户端连接已关闭")
             
             return StreamingResponse(
                 stream_response(),
