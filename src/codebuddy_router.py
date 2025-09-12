@@ -232,11 +232,18 @@ async def chat_completions(
                     last_system_fp = None
                     saw_any = False
 
+                    # 使用缓冲区确保SSE事件完整性（非流式也需要）
+                    buffer = b""
                     async for _chunk in response.aiter_bytes():
                         if not _chunk:
                             continue
-                        _s = _chunk.decode('utf-8', errors='ignore')
-                        for _line in _s.split('\n'):
+                        buffer += _chunk
+                        
+                        # 按行处理，确保完整的SSE事件
+                        while b'\n' in buffer:
+                            line_bytes, buffer = buffer.split(b'\n', 1)
+                            _line = line_bytes.decode('utf-8', errors='ignore')
+                            
                             if not _line.startswith('data: '):
                                 continue
                             _data = _line[6:].strip()
@@ -276,7 +283,7 @@ async def chat_completions(
                                     _incoming_id = _tc.get('id')
                                     _pos = active_pos_by_index.get(_idx)
                                     # Start a new call when first seen for this index or id changes
-                                    if _pos is None or (_incoming_id and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
+                                    if _pos is None or (_pos is not None and _incoming_id and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
                                         tool_calls.append({
                                             'id': _incoming_id,
                                             'type': _tc.get('type', 'function'),
