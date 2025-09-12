@@ -21,12 +21,14 @@ class CodeBuddyTokenManager:
             creds_dir = get_codebuddy_creds_dir()
         
         self.creds_dir = os.path.join(os.path.dirname(__file__), '..', creds_dir)
+        self.state_file = os.path.join(self.creds_dir, 'manager_state.json')
         self.credentials = []
         self.current_index = 0  # Start from the first credential
         self.usage_count = 0    # Counter for the current credential usage
         self.manual_selected_index = None  # 手动选择的凭证索引
         self.auto_rotation_enabled = True  # 自动轮换开关，默认开启
         self.load_all_tokens()
+        self.load_state()  # 加载保存的状态
     
     def load_all_tokens(self):
         """加载所有token文件"""
@@ -57,6 +59,68 @@ class CodeBuddyTokenManager:
                 logger.error(f"Failed to load credential file {os.path.basename(file_path)}: {e}")
         
         logger.info(f"Loaded a total of {len(self.credentials)} CodeBuddy credentials.")
+    
+    def load_state(self):
+        """加载管理器状态"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    state = json.load(f)
+                    
+                # 恢复状态，但要验证索引是否还有效
+                saved_manual_index = state.get('manual_selected_index')
+                if saved_manual_index is not None and 0 <= saved_manual_index < len(self.credentials):
+                    # 验证凭证文件是否还存在
+                    if saved_manual_index < len(self.credentials):
+                        saved_filename = state.get('manual_selected_filename')
+                        current_filename = os.path.basename(self.credentials[saved_manual_index]['file_path'])
+                        if saved_filename == current_filename:
+                            self.manual_selected_index = saved_manual_index
+                            self.current_index = saved_manual_index
+                            logger.info(f"Restored manual selection: {current_filename} (index: {saved_manual_index})")
+                        else:
+                            logger.warning(f"Saved credential filename mismatch, ignoring saved selection")
+                
+                # 恢复自动轮换状态
+                self.auto_rotation_enabled = state.get('auto_rotation_enabled', True)
+                
+                # 恢复当前索引（如果没有手动选择的话）
+                if self.manual_selected_index is None:
+                    saved_current_index = state.get('current_index', 0)
+                    if 0 <= saved_current_index < len(self.credentials):
+                        self.current_index = saved_current_index
+                    
+                logger.info(f"State loaded: auto_rotation={self.auto_rotation_enabled}, current_index={self.current_index}")
+        except Exception as e:
+            logger.warning(f"Failed to load manager state: {e}")
+    
+    def save_state(self):
+        """保存管理器状态"""
+        try:
+            # 确保目录存在
+            if not os.path.exists(self.creds_dir):
+                os.makedirs(self.creds_dir)
+            
+            state = {
+                'auto_rotation_enabled': self.auto_rotation_enabled,
+                'current_index': self.current_index,
+                'manual_selected_index': self.manual_selected_index,
+                'manual_selected_filename': None,
+                'saved_at': int(time.time())
+            }
+            
+            # 如果有手动选择，保存文件名用于验证
+            if self.manual_selected_index is not None and 0 <= self.manual_selected_index < len(self.credentials):
+                state['manual_selected_filename'] = os.path.basename(
+                    self.credentials[self.manual_selected_index]['file_path']
+                )
+            
+            with open(self.state_file, 'w', encoding='utf-8') as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+                
+            logger.debug(f"Manager state saved to {self.state_file}")
+        except Exception as e:
+            logger.error(f"Failed to save manager state: {e}")
     
     def is_token_expired(self, credential_data: Dict) -> bool:
         """检查token是否过期"""
@@ -293,8 +357,10 @@ class CodeBuddyTokenManager:
         """手动选择指定索引的凭证"""
         if 0 <= index < len(self.credentials):
             self.manual_selected_index = index
+            self.current_index = index  # 更新当前索引
             credential_filename = os.path.basename(self.credentials[index]['file_path'])
             logger.info(f"Manually selected credential: {credential_filename} (index: {index})")
+            self.save_state()  # 保存状态
             return True
         else:
             logger.error(f"Invalid credential index: {index}")
@@ -304,6 +370,7 @@ class CodeBuddyTokenManager:
         """清除手动选择，恢复自动轮换"""
         self.manual_selected_index = None
         logger.info("Cleared manual credential selection, resumed automatic rotation")
+        self.save_state()  # 保存状态
     
     def enable_auto_rotation(self):
         """开启自动轮换"""
@@ -320,6 +387,7 @@ class CodeBuddyTokenManager:
         self.auto_rotation_enabled = not self.auto_rotation_enabled
         status = "enabled" if self.auto_rotation_enabled else "disabled"
         logger.info(f"Auto rotation toggled: {status}")
+        self.save_state()  # 保存状态
         return self.auto_rotation_enabled
     
     def get_current_credential_info(self) -> Dict:
@@ -331,7 +399,7 @@ class CodeBuddyTokenManager:
         
         rotation_count = get_rotation_count()
         
-        if self.manual_selected_index is not None:
+        if self.manual_selected_index is not None and 0 <= self.manual_selected_index < len(self.credentials):
             credential = self.credentials[self.manual_selected_index]
             return {
                 "status": "manual_selected",
@@ -340,6 +408,9 @@ class CodeBuddyTokenManager:
                 "user_id": credential['data'].get('user_id', 'unknown')
             }
         elif not self.auto_rotation_enabled:
+            # 确保current_index有效
+            if not (0 <= self.current_index < len(self.credentials)):
+                self.current_index = 0
             credential = self.credentials[self.current_index]
             return {
                 "status": "auto_rotation_disabled",
@@ -350,6 +421,9 @@ class CodeBuddyTokenManager:
                 "auto_rotation_enabled": False
             }
         elif rotation_count == 0:
+            # 确保current_index有效
+            if not (0 <= self.current_index < len(self.credentials)):
+                self.current_index = 0
             credential = self.credentials[self.current_index]
             return {
                 "status": "rotation_count_zero",
@@ -360,6 +434,9 @@ class CodeBuddyTokenManager:
                 "auto_rotation_enabled": True
             }
         else:
+            # 确保current_index有效
+            if not (0 <= self.current_index < len(self.credentials)):
+                self.current_index = 0
             credential = self.credentials[self.current_index]
             return {
                 "status": "auto_rotation",

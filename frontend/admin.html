@@ -752,6 +752,28 @@
             text-align: right;
             font-weight: 500;
         }
+
+        /* 选中的凭证样式 */
+        .credential-item-selected {
+            border: 2px solid var(--primary-color) !important;
+            background: rgba(59, 130, 246, 0.05) !important;
+            box-shadow: 0 2px 8px rgba(59, 130, 246, 0.15) !important;
+        }
+        
+        body.dark .credential-item-selected {
+            background: rgba(59, 130, 246, 0.1) !important;
+        }
+
+        .credential-selected-badge {
+            display: inline-block;
+            background: var(--primary-color);
+            color: white;
+            font-size: 0.75rem;
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            margin-left: 0.5rem;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -1417,6 +1439,9 @@
         }
 
         function displayCurrentCredentialStatus(data) {
+            // 保存状态信息供其他函数使用
+            window.lastCredentialStatus = data;
+            
             const statusDiv = document.getElementById('currentCredentialStatus');
             let statusHtml = '';
             let statusClass = '';
@@ -1510,6 +1535,15 @@
                     if (!groups[key]) groups[key] = [];
                     groups[key].push({ cred, index });
                 });
+                
+                // 获取当前选中的凭证索引
+                let currentSelectedIndex = -1;
+                try {
+                    const currentStatus = window.lastCredentialStatus || {};
+                    currentSelectedIndex = currentStatus.index || -1;
+                } catch (e) {
+                    // 忽略错误
+                }
 
                 const groupKeys = Object.keys(groups).sort((a, b) => a.localeCompare(b));
                 let html = '';
@@ -1538,11 +1572,19 @@
                                 statusIcon = `<i class="fas fa-question-circle" style="color: var(--secondary-color); font-size: 1.5rem;" title="未验证"></i>`;
                         }
 
+                        // 检查是否为当前选中的凭证
+                        const isSelected = index === currentSelectedIndex;
+                        const selectedClass = isSelected ? ' credential-item-selected' : '';
+                        const selectedBadge = isSelected ? '<span class="credential-selected-badge">当前使用</span>' : '';
+
                         return `
-                            <div class="credential-item">
+                            <div class="credential-item${selectedClass}">
                                 <div class="credential-status-icon">${statusIcon}</div>
                                 <div class="credential-info">
-                                    <div class="credential-id">凭证 #${index + 1} ${cred.filename ? `<small style=\"color: var(--secondary-color);\">(${cred.filename})</small>` : ''}</div>
+                                    <div class="credential-id">
+                                        凭证 #${index + 1} ${selectedBadge}
+                                        ${cred.filename ? `<small style=\"color: var(--secondary-color);\">(${cred.filename})</small>` : ''}
+                                    </div>
                                     <div class="credential-details">
                                         ${cred.user_id ? `用户ID: ${cred.user_id}<br>` : ''}
                                         ${cred.token_preview ? `Token: ${cred.token_preview}<br>` : ''}
@@ -1552,9 +1594,14 @@
                                     </div>
                                 </div>
                                 <div class="credential-actions">
-                                    <button class="btn btn-warning" onclick="selectCredential(${index})" title="手动选择此凭证">
-                                        <i class="fas fa-hand-pointer"></i> 选择
-                                    </button>
+                                    ${isSelected ? 
+                                        `<button class="btn btn-secondary" disabled title="已选中">
+                                            <i class="fas fa-check"></i> 已选中
+                                        </button>` :
+                                        `<button class="btn btn-warning" onclick="selectCredential(${index})" title="手动选择此凭证">
+                                            <i class="fas fa-hand-pointer"></i> 选择
+                                        </button>`
+                                    }
                                     <button class="btn btn-success" onclick="testCredential(${index})">
                                         <i class="fas fa-check"></i> 测试
                                     </button>
@@ -1690,7 +1737,8 @@
                 if (response.ok) {
                     const data = await response.json();
                     showNotification(`✓ ${data.message}`, 'success');
-                    loadCurrentCredentialStatus(); // 刷新状态显示
+                    await loadCurrentCredentialStatus(); // 刷新状态显示
+                    displayCredentials(); // 刷新凭证列表显示
                 } else {
                     const errorData = await response.json();
                     showNotification(`选择失败: ${errorData.detail}`, 'error');
@@ -1771,8 +1819,9 @@
                     }
                 }
                 
-                // 刷新状态显示
-                loadCurrentCredentialStatus();
+                // 刷新状态显示和凭证列表
+                await loadCurrentCredentialStatus();
+                displayCredentials();
                 
             } catch (error) {
                 showNotification(`操作失败: ${error.message}`, 'error');
