@@ -48,6 +48,13 @@ async def chat_completions(
         except Exception as e:
             logger.error(f"解析请求体失败: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {str(e)}")
+
+        # Log client stream preference for this request
+        try:
+            client_wants_stream = bool(request_body.get("stream", False))
+            logger.info(f"[REQ] /v1/chat/completions client_stream={client_wants_stream} model={request_body.get('model')}")
+        except Exception:
+            client_wants_stream = False
         
         # 获取CodeBuddy凭证
         credential = codebuddy_token_manager.get_next_credential()
@@ -80,6 +87,12 @@ async def chat_completions(
         payload["stream"] = True  # CodeBuddy 只支持流式请求
         
         # 处理消息长度要求：CodeBuddy要求至少2条消息
+        try:
+            logger.info(
+                f"[ROUTE] client_stream={client_wants_stream} -> upstream_stream=True model={payload.get('model')} conv_id={headers.get('X-Conversation-ID')} req_id={headers.get('X-Request-ID')}"
+            )
+        except Exception:
+            pass
         messages = payload.get("messages", [])
         if len(messages) == 1 and messages[0].get("role") == "user":
             # 添加系统消息
@@ -142,6 +155,11 @@ async def chat_completions(
         # 检查客户端是否期望流式响应
         client_wants_stream = request_body.get("stream", False)
         
+        try:
+            logger.info(f"[ROUTE] selected_path={'stream' if client_wants_stream else 'non-stream-aggregate'}")
+        except Exception:
+            pass
+
         if client_wants_stream:
             # 客户端要求流式，直接透传
             async def stream_response():
@@ -156,7 +174,7 @@ async def chat_completions(
             
             return StreamingResponse(
                 stream_response(),
-                media_type="text/plain",
+                media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
@@ -168,6 +186,135 @@ async def chat_completions(
             )
         else:
             # 客户端要求非流式，收集并合并所有流式响应块（真正透传）
+            # Rewritten: aggregate SSE chunks into a single non-stream response (minimal + complete)
+            agg_id = None
+            agg_model = None
+            agg_content = ""
+            # Maintain ordered list of tool calls + active mapping by index
+            tool_calls: List[Dict[str, Any]] = []
+            active_pos_by_index: Dict[int, int] = {}
+            last_finish_reason = None
+            last_usage = None
+            last_system_fp = None
+            saw_any = False
+            logger.info("[AGG] enter non-stream aggregation")
+
+            async for _chunk in response.aiter_bytes():
+                if not _chunk:
+                    continue
+                _s = _chunk.decode('utf-8', errors='ignore')
+                for _line in _s.split('\n'):
+                    if not _line.startswith('data: '):
+                        continue
+                    _data = _line[6:].strip()
+                    if not _data or _data == '[DONE]':
+                        continue
+                    try:
+                        _obj = json.loads(_data)
+                    except json.JSONDecodeError:
+                        continue
+
+                    saw_any = True
+                    agg_id = agg_id or _obj.get('id')
+                    agg_model = agg_model or _obj.get('model')
+                    last_system_fp = _obj.get('system_fingerprint') or last_system_fp
+                    if _obj.get('usage'):
+                        last_usage = _obj.get('usage')
+
+                    _choices = _obj.get('choices') or []
+                    if not _choices:
+                        continue
+                    _c0 = _choices[0]
+                    _fr = _c0.get('finish_reason')
+                    if _fr:
+                        last_finish_reason = _fr
+                    _delta = _c0.get('delta') or {}
+                    _text_piece = _delta.get('content')
+                    if _text_piece:
+                        agg_content += _text_piece
+                    _tc_list = _delta.get('tool_calls')
+                    if isinstance(_tc_list, list):
+                        for _tc in _tc_list:
+                            if not isinstance(_tc, dict):
+                                continue
+                            _idx = _tc.get('index')
+                            if _idx is None:
+                                continue
+                            _incoming_id = _tc.get('id')
+                            _pos = active_pos_by_index.get(_idx)
+                            # Start a new call when first seen for this index or id changes
+                            if _pos is None or (_incoming_id and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
+                                tool_calls.append({
+                                    'id': _incoming_id,
+                                    'type': _tc.get('type', 'function'),
+                                    'function': {'name': (_tc.get('function') or {}).get('name', ''), 'arguments': ''}
+                                })
+                                _pos = len(tool_calls) - 1
+                                active_pos_by_index[_idx] = _pos
+                                logger.info(f"[AGG] start tool_call index={_idx} id={_incoming_id} name={(_tc.get('function') or {}).get('name','')}")
+                            # Merge updates into active call
+                            if _incoming_id and not tool_calls[_pos].get('id'):
+                                tool_calls[_pos]['id'] = _incoming_id
+                            if _tc.get('type'):
+                                tool_calls[_pos]['type'] = _tc.get('type')
+                            _func = _tc.get('function') or {}
+                            _name = _func.get('name')
+                            if _name:
+                                tool_calls[_pos]['function']['name'] = _name
+                            _args_piece = _func.get('arguments')
+                            if _args_piece:
+                                tool_calls[_pos]['function']['arguments'] += _args_piece
+
+            if not saw_any:
+                return {"error": "No valid response received from CodeBuddy", "details": "Stream ended without complete response"}
+
+            _final_message = {"role": "assistant", "content": agg_content}
+            if tool_calls:
+                _final_message["tool_calls"] = tool_calls
+            _finish_reason = "tool_calls" if tool_calls else (last_finish_reason or "stop")
+
+            # Validate tool_calls.function.arguments JSON (log only, no mutation)
+            try:
+                if tool_calls:
+                    for _i, _tc in enumerate(tool_calls):
+                        _func = _tc.get('function') or {}
+                        _args = _func.get('arguments')
+                        if isinstance(_args, str) and _args.strip():
+                            try:
+                                json.loads(_args)
+                            except Exception as _ve:
+                                _preview = _args[:200].replace('\n', ' ')
+                                logger.warning(f"[AGG_VALIDATE] tool_calls[{_i}] arguments not valid JSON: {_ve}; preview={_preview}")
+                        else:
+                            logger.debug(f"[AGG_VALIDATE] tool_calls[{_i}] has empty arguments")
+            except Exception as _e:
+                logger.warning(f"[AGG_VALIDATE] validation step error: {_e}")
+            _final_response = {
+                "id": agg_id or str(uuid.uuid4()),
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": agg_model or "unknown",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": _final_message,
+                        "finish_reason": _finish_reason,
+                        "logprobs": None
+                    }
+                ]
+            }
+            if last_usage:
+                _final_response["usage"] = last_usage
+            if last_system_fp:
+                _final_response["system_fingerprint"] = last_system_fp
+            try:
+                _tc_count = len(tool_calls)
+            except Exception:
+                _tc_count = 0
+            logger.info(f"[AGG] finalize id={agg_id} model={agg_model} content_len={len(agg_content)} tool_calls={_tc_count} finish_reason={_finish_reason}")
+            return _final_response
+
+            # Unreachable legacy aggregation below (kept for reference)
             all_chunks = []
             
             # 收集所有流式响应块
