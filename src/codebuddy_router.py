@@ -8,12 +8,12 @@ import logging
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, Depends, Request, Header
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 
 from .auth import authenticate
 from .codebuddy_api_client import codebuddy_api_client
 from .codebuddy_token_manager import codebuddy_token_manager
 from .usage_stats_manager import usage_stats_manager
+from .keyword_replacer import apply_keyword_replacement_to_system_message
 
 logger = logging.getLogger(__name__)
 
@@ -82,26 +82,10 @@ async def chat_completions(
             payload["messages"] = [system_msg] + messages
         
         # 应用关键词替换 - 防止CodeBuddy检测到竞争对手关键词
-        def apply_keyword_replacement(text):
-            if isinstance(text, str):
-                text = text.replace("Claude Code", "CodeBuddy Code")
-                text = text.replace("Anthropic's official CLI for Claude", "Tencent's official CLI for CodeBuddy")
-                text = text.replace("Claude", "CodeBuddy")
-                text = text.replace("Anthropic", "Tencent")
-                text = text.replace("https://github.com/anthropics/claude-code/issues", "https://cnb.cool/codebuddy/codebuddy-code/-/issues")
-                return text
-            return text
-        
-        # 对所有消息应用关键词替换
+        # 只对 system role 的消息应用关键词替换
         for msg in payload.get("messages", []):
-            if msg.get("role") == "system" and isinstance(msg.get("content"), str):
-                msg["content"] = apply_keyword_replacement(msg["content"])
-            elif isinstance(msg.get("content"), str):
-                msg["content"] = apply_keyword_replacement(msg["content"])
-            elif isinstance(msg.get("content"), list):
-                for item in msg["content"]:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        item["text"] = apply_keyword_replacement(item.get("text", ""))
+            if msg.get("role") == "system":
+                msg["content"] = apply_keyword_replacement_to_system_message(msg.get("content"))
         
         # 检查客户端是否期望流式响应
         client_wants_stream = request_body.get("stream", False)
@@ -132,7 +116,8 @@ async def chat_completions(
                             error_text = await response.aread()
                             error_msg = error_text.decode('utf-8', errors='ignore')
                             logger.error(f"CodeBuddy API错误: {response.status_code} - {error_msg}")
-                            error_chunk = f'data: {{"error": "CodeBuddy API error: {response.status_code} - {error_msg}"}}\n\n'
+                            error_data = {"error": f"CodeBuddy API error: {response.status_code} - {error_msg}"}
+                            error_chunk = f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
                             yield error_chunk.encode('utf-8')
                             return
                         
@@ -162,24 +147,33 @@ async def chat_completions(
                                     if b'[DONE]' in line:
                                         done_found = True
                         
-                        # 处理缓冲区中剩余的数据
+                        # 处理缓冲区中剩余的数据（确保SSE事件完整性）
                         if buffer:
-                            yield buffer
+                            # 检查是否是完整的SSE事件
+                            buffer_str = buffer.decode('utf-8', errors='ignore')
+                            if buffer_str.strip():
+                                # 如果不是以换行符结尾，添加换行符确保SSE格式正确
+                                if not buffer_str.endswith('\n'):
+                                    buffer += b'\n'
+                                yield buffer
                         
                         if not done_found:
                             logger.warning("[STREAM] 流结束但未发现[DONE]标记")
                                 
                 except httpx.TimeoutException as e:
                     logger.error(f"CodeBuddy API 超时: {e}")
-                    error_chunk = f'data: {{"error": "CodeBuddy API timeout: {str(e)}"}}\n\n'
+                    error_data = {"error": f"CodeBuddy API timeout: {str(e)}"}
+                    error_chunk = f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
                     yield error_chunk.encode('utf-8')
                 except httpx.NetworkError as e:
                     logger.error(f"网络错误: {e}")
-                    error_chunk = f'data: {{"error": "Network error: {str(e)}"}}\n\n'
+                    error_data = {"error": f"Network error: {str(e)}"}
+                    error_chunk = f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
                     yield error_chunk.encode('utf-8')
                 except Exception as e:
                     logger.error(f"流式响应错误: {e}", exc_info=True)
-                    error_chunk = f'data: {{"error": "Stream interrupted: {str(e)}"}}\n\n'
+                    error_data = {"error": f"Stream interrupted: {str(e)}"}
+                    error_chunk = f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
                     yield error_chunk.encode('utf-8')
                 finally:
                     # 确保客户端连接被正确关闭
@@ -283,7 +277,7 @@ async def chat_completions(
                                     _incoming_id = _tc.get('id')
                                     _pos = active_pos_by_index.get(_idx)
                                     # Start a new call when first seen for this index or id changes
-                                    if _pos is None or (_pos is not None and _incoming_id and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
+                                    if _pos is None or (_pos is not None and _incoming_id and _pos < len(tool_calls) and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
                                         tool_calls.append({
                                             'id': _incoming_id,
                                             'type': _tc.get('type', 'function'),
@@ -303,6 +297,69 @@ async def chat_completions(
                                     _args_piece = _func.get('arguments')
                                     if _args_piece:
                                         tool_calls[_pos]['function']['arguments'] += _args_piece
+
+                    # 处理缓冲区中剩余的最后一行数据（如果存在）
+                    if buffer:
+                        line_bytes = buffer
+                        _line = line_bytes.decode('utf-8', errors='ignore').strip()
+                        
+                        if _line.startswith('data: '):
+                            _data = _line[6:].strip()
+                            if _data and _data != '[DONE]':
+                                try:
+                                    _obj = json.loads(_data)
+                                    # 安全地处理最后一行数据，使用相同的逻辑
+                                    saw_any = True
+                                    agg_id = agg_id or _obj.get('id')
+                                    agg_model = agg_model or _obj.get('model')
+                                    last_system_fp = _obj.get('system_fingerprint') or last_system_fp
+                                    if _obj.get('usage'):
+                                        last_usage = _obj.get('usage')
+
+                                    _choices = _obj.get('choices') or []
+                                    if _choices:
+                                        _c0 = _choices[0]
+                                        _fr = _c0.get('finish_reason')
+                                        if _fr:
+                                            last_finish_reason = _fr
+                                        _delta = _c0.get('delta') or {}
+                                        _text_piece = _delta.get('content')
+                                        if _text_piece:
+                                            agg_content += _text_piece
+                                        # 处理工具调用（如果有）
+                                        _tc_list = _delta.get('tool_calls')
+                                        if isinstance(_tc_list, list):
+                                            for _tc in _tc_list:
+                                                if not isinstance(_tc, dict):
+                                                    continue
+                                                _idx = _tc.get('index')
+                                                if _idx is None:
+                                                    continue
+                                                _incoming_id = _tc.get('id')
+                                                _pos = active_pos_by_index.get(_idx)
+                                                if _pos is None or (_pos is not None and _incoming_id and _pos < len(tool_calls) and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
+                                                    tool_calls.append({
+                                                        'id': _incoming_id,
+                                                        'type': _tc.get('type', 'function'),
+                                                        'function': {'name': (_tc.get('function') or {}).get('name', ''), 'arguments': ''}
+                                                    })
+                                                    _pos = len(tool_calls) - 1
+                                                    active_pos_by_index[_idx] = _pos
+                                                if _pos < len(tool_calls):  # 安全检查
+                                                    if _incoming_id and not tool_calls[_pos].get('id'):
+                                                        tool_calls[_pos]['id'] = _incoming_id
+                                                    if _tc.get('type'):
+                                                        tool_calls[_pos]['type'] = _tc.get('type')
+                                                    _func = _tc.get('function') or {}
+                                                    _name = _func.get('name')
+                                                    if _name:
+                                                        tool_calls[_pos]['function']['name'] = _name
+                                                    _args_piece = _func.get('arguments')
+                                                    if _args_piece:
+                                                        tool_calls[_pos]['function']['arguments'] += _args_piece
+                                except json.JSONDecodeError:
+                                    # 静默忽略无效的JSON，避免破坏现有逻辑
+                                    pass
 
             except httpx.TimeoutException:
                 logger.error("CodeBuddy API 超时")
@@ -381,11 +438,7 @@ async def chat_completions(
 async def list_v1_models(_token: str = Depends(authenticate)):
     """获取CodeBuddy V1模型列表"""
     try:
-        # NOTE: 此端点不再消耗凭证，因为它只返回一个静态列表。
-        # 只需要服务级别的认证即可。
-        # credential = codebuddy_token_manager.get_next_credential()
-        # if not credential:
-        #     raise HTTPException(status_code=401, detail="没有可用的CodeBuddy凭证")
+        # 此端点只返回静态模型列表，不需要消耗凭证
         
         models = [
             "claude-4.0",
