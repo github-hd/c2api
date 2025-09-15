@@ -24,8 +24,8 @@
 
 首先，克隆本项目到本地：
 ```bash
-git clone https://your-repository-url/CodeBuddy2API.git
-cd CodeBuddy2API
+git clone https://github.com/xueyue33/codebuddy2api.git
+cd codebuddy2api
 ```
 
 然后，运行启动脚本。此脚本会自动创建 Python 虚拟环境并安装所有必需的依赖。
@@ -37,10 +37,10 @@ start.bat
 
 **Linux / macOS:**
 ```bash
-# （请根据 start.bat 的逻辑创建等效的 start.sh 脚本）
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+python web.py
 ```
 
 ### 3. 配置环境变量
@@ -173,11 +173,14 @@ curl -X POST "http://127.0.0.1:8001/codebuddy/v1/chat/completions" \
 codebuddy2api/
 ├── src/                           # 源代码目录
 │   ├── auth.py                    # 服务访问认证模块
-│   ├── models.py                  # Pydantic 数据模型定义
 │   ├── codebuddy_api_client.py    # 封装了与CodeBuddy官方API的通信
+│   ├── codebuddy_auth_router.py   # CodeBuddy OAuth2 认证路由
 │   ├── codebuddy_token_manager.py # CodeBuddy凭证加载与轮换管理器
-│   ├── codebuddy_router.py        # 核心API路由 (v1)
-│   └── frontend_router.py         # Web管理界面的路由
+│   ├── codebuddy_router.py        # 核心API路由 (v1) - 已重构优化
+│   ├── frontend_router.py         # Web管理界面的路由
+│   ├── settings_router.py         # 设置管理路由
+│   ├── usage_stats_manager.py     # 使用统计管理器
+│   └── keyword_replacer.py        # 关键词替换模块
 ├── frontend/
 │   └── admin.html                 # Web管理界面的前端页面
 ├── .codebuddy_creds/              # 存放CodeBuddy凭证的目录 (Git会忽略其中的文件)
@@ -186,6 +189,9 @@ codebuddy2api/
 ├── requirements.txt               # Python依赖列表
 ├── .env.example                   # 环境变量示例文件
 ├── start.bat                      # Windows一键启动脚本
+├── docker-compose.yml             # Docker Compose 配置
+├── Dockerfile                     # Docker 镜像构建文件
+├── entrypoint.sh                  # Docker 容器入口脚本
 └── README.md                      # 本文档
 ```
 
@@ -202,6 +208,8 @@ codebuddy2api/
 | `CODEBUDDY_CREDS_DIR` | `.codebuddy_creds` | 存放 CodeBuddy 认证凭证的目录。 |
 | `CODEBUDDY_LOG_LEVEL` | `INFO` | 日志级别，可选 `DEBUG`, `INFO`, `WARNING`, `ERROR`。 |
 | `CODEBUDDY_MODELS` | (列表) | 向客户端报告的可用模型列表，用逗号分隔。 |
+| `CODEBUDDY_SSL_VERIFY` | `false` | SSL验证开关，设置为 `true` 启用SSL验证。 |
+| `CODEBUDDY_ROTATION_COUNT` | `10` | 凭证轮换计数，每N次请求后切换凭证。 |
 
 ## 🐛 故障排除
 
