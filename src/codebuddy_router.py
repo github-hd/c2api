@@ -146,25 +146,58 @@ def parse_sse_line(line: str) -> Optional[Dict[str, Any]]:
         return None
 
 def validate_and_fix_tool_call_args(args: str) -> str:
-    """验证和修复工具调用参数的JSON格式"""
+    """增强版的工具调用参数验证和修复 - 专门处理多工具调用问题"""
     if not args:
         return '{}'
     
+    args = args.strip()
+    
+    # 检查是否是多个JSON对象连接的情况 - 这是多工具调用的主要问题
+    if args.count('}{') > 0:
+        # 尝试分离多个JSON对象
+        json_objects = []
+        current_obj = ""
+        brace_count = 0
+        
+        for i, char in enumerate(args):
+            current_obj += char
+            if char == '{':
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and current_obj.strip():
+                    # 完成了一个JSON对象
+                    try:
+                        parsed = json.loads(current_obj.strip())
+                        json_objects.append(parsed)
+                        current_obj = ""
+                    except json.JSONDecodeError:
+                        current_obj = ""
+        
+        if json_objects:
+            return json.dumps(json_objects[0], ensure_ascii=False)
+    
+    # 原有的修复逻辑
     try:
         json.loads(args)
         return args
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        
+        
         # 尝试修复常见的JSON问题
+        original_args = args
         if not args.endswith('}') and args.count('{') > args.count('}'):
             args += '}'
+            
         elif not args.endswith(']') and args.count('[') > args.count(']'):
             args += ']'
+            
         
         try:
             json.loads(args)
+            
             return args
-        except:
-            logger.warning(f"无法修复工具调用参数JSON: {args}")
+        except json.JSONDecodeError:
             return '{}'
 
 class SSEConnectionManager:
@@ -246,6 +279,12 @@ class StreamResponseAggregator:
         for tc in tool_calls:
             idx = tc.get('index')
             if idx is None:
+                continue
+            
+            # 确保index是整数
+            try:
+                idx = int(idx)
+            except (ValueError, TypeError):
                 continue
             
             # 初始化工具调用
@@ -332,7 +371,7 @@ class CodeBuddyStreamService:
             raise HTTPException(status_code=status_code, detail=f"CodeBuddy API error: {error_msg}")
     
     async def handle_stream_response(self, payload: Dict[str, Any], headers: Dict[str, str]) -> StreamingResponse:
-        """处理流式响应 - 使用连接池"""
+        """处理流式响应 - 修复多工具调用的流式传递问题"""
         async def stream_core():
             client = await get_http_client()
             async with client.stream("POST", get_codebuddy_api_url(), json=payload, headers=headers) as response:
@@ -343,19 +382,32 @@ class CodeBuddyStreamService:
                     return
                 
                 buffer = ""
+                
+                
                 async for chunk in response.aiter_text(chunk_size=8192):
                     if not chunk:
                         continue
                     
+                    
                     buffer += chunk
+                    
+                    # 处理完整的SSE行
                     while '\n' in buffer:
                         line, buffer = buffer.split('\n', 1)
+                        
+                        
+                        # 跳过空行和注释行
                         if not line.strip() or line.startswith(':'):
                             continue
+                        
+                        # 确保SSE格式正确：保持原始格式
                         yield line + '\n'
+                        
+                        # 检查是否结束
                         if '[DONE]' in line:
                             return
                 
+                # 处理缓冲区中剩余的数据
                 if buffer.strip():
                     yield buffer + '\n'
         
