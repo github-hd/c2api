@@ -5,6 +5,8 @@ import json
 import time
 import uuid
 import logging
+import asyncio
+import httpx
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, Depends, Request, Header
 from fastapi.responses import StreamingResponse
@@ -18,6 +20,199 @@ from .keyword_replacer import apply_keyword_replacement_to_system_message
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# --- 辅助函数 ---
+
+def format_sse_error(message: str, error_type: str = "stream_error") -> str:
+    """格式化SSE错误响应"""
+    error_data = {
+        "error": {
+            "message": message,
+            "type": error_type
+        }
+    }
+    return f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
+
+def parse_sse_line(line: str) -> Optional[Dict[str, Any]]:
+    """解析单行SSE数据"""
+    if not line.startswith('data: '):
+        return None
+    
+    data = line[6:].strip()
+    if not data or data == '[DONE]':
+        return None
+    
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError:
+        return None
+
+def validate_and_fix_tool_call_args(args: str) -> str:
+    """验证和修复工具调用参数的JSON格式"""
+    if not args:
+        return '{}'
+    
+    try:
+        json.loads(args)
+        return args
+    except json.JSONDecodeError:
+        # 尝试修复常见的JSON问题
+        if not args.endswith('}') and args.count('{') > args.count('}'):
+            args += '}'
+        elif not args.endswith(']') and args.count('[') > args.count(']'):
+            args += ']'
+        
+        try:
+            json.loads(args)
+            return args
+        except:
+            logger.warning(f"无法修复工具调用参数JSON: {args}")
+            return '{}'
+
+class SSEConnectionManager:
+    """SSE 连接管理器，包含重连逻辑"""
+    
+    def __init__(self, max_retries: int = 3, retry_delay: float = 1.0):
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+    
+    async def stream_with_retry(self, stream_func, *args, **kwargs):
+        """带重连的流式处理"""
+        for attempt in range(self.max_retries + 1):
+            try:
+                async for chunk in stream_func(*args, **kwargs):
+                    yield chunk
+                break  # 成功完成，退出重试循环
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                if attempt < self.max_retries:
+                    wait_time = self.retry_delay * (2 ** attempt)  # 指数退避: 1s, 2s, 4s
+                    logger.warning(f"连接失败，{wait_time}秒后重试 (第{attempt + 1}次): {e}")
+                    yield format_sse_error(f"Connection lost, retrying in {wait_time}s... (attempt {attempt + 1})", "connection_retry")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"重连失败，已达到最大重试次数: {e}")
+                    yield format_sse_error(f"Connection failed after {self.max_retries} retries: {str(e)}", "connection_failed")
+                    raise
+            except Exception as e:
+                # 其他异常不重试，直接抛出
+                logger.error(f"流式处理异常: {e}")
+                yield format_sse_error(f"Stream error: {str(e)}", "stream_error")
+                raise
+
+class StreamResponseAggregator:
+    """流式响应聚合器"""
+    
+    def __init__(self):
+        self.data = {
+            "id": None,
+            "model": None,
+            "content": "",
+            "tool_calls": [],
+            "finish_reason": None,
+            "usage": None,
+            "system_fingerprint": None
+        }
+        self.tool_call_map = {}
+    
+    def process_chunk(self, obj: Dict[str, Any]):
+        """处理单个响应块"""
+        # 聚合基本信息
+        self.data["id"] = self.data["id"] or obj.get('id')
+        self.data["model"] = self.data["model"] or obj.get('model')
+        self.data["system_fingerprint"] = obj.get('system_fingerprint') or self.data["system_fingerprint"]
+        
+        if obj.get('usage'):
+            self.data["usage"] = obj.get('usage')
+        
+        choices = obj.get('choices', [])
+        if not choices:
+            return
+        
+        choice = choices[0]
+        if choice.get('finish_reason'):
+            self.data["finish_reason"] = choice.get('finish_reason')
+        
+        delta = choice.get('delta', {})
+        
+        # 聚合内容
+        if delta.get('content'):
+            self.data["content"] += delta.get('content')
+        
+        # 处理工具调用
+        if delta.get('tool_calls'):
+            self._process_tool_calls(delta.get('tool_calls'))
+    
+    def _process_tool_calls(self, tool_calls: List[Dict[str, Any]]):
+        """处理工具调用"""
+        for tc in tool_calls:
+            idx = tc.get('index')
+            if idx is None:
+                continue
+            
+            # 初始化工具调用
+            if idx not in self.tool_call_map:
+                self.tool_call_map[idx] = {
+                    'id': tc.get('id', ''),
+                    'type': tc.get('type', 'function'),
+                    'function': {
+                        'name': '',
+                        'arguments': ''
+                    }
+                }
+            
+            # 更新工具调用信息
+            if tc.get('id'):
+                self.tool_call_map[idx]['id'] = tc.get('id')
+            if tc.get('type'):
+                self.tool_call_map[idx]['type'] = tc.get('type')
+            
+            func = tc.get('function', {})
+            if func.get('name'):
+                self.tool_call_map[idx]['function']['name'] = func.get('name')
+            if func.get('arguments'):
+                self.tool_call_map[idx]['function']['arguments'] += func.get('arguments')
+    
+    def finalize(self) -> Dict[str, Any]:
+        """完成聚合并返回最终响应"""
+        # 构建工具调用列表
+        if self.tool_call_map:
+            self.data["tool_calls"] = [self.tool_call_map[i] for i in sorted(self.tool_call_map.keys())]
+            
+            # 验证和修复工具调用参数
+            for tc in self.data["tool_calls"]:
+                tc['function']['arguments'] = validate_and_fix_tool_call_args(
+                    tc['function']['arguments']
+                )
+        
+        # 构建最终响应
+        final_message = {"role": "assistant", "content": self.data["content"]}
+        if self.data["tool_calls"]:
+            final_message["tool_calls"] = self.data["tool_calls"]
+        
+        finish_reason = "tool_calls" if self.data["tool_calls"] else (self.data["finish_reason"] or "stop")
+        
+        final_response = {
+            "id": self.data["id"] or str(uuid.uuid4()),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": self.data["model"] or "unknown",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": final_message,
+                    "finish_reason": finish_reason,
+                    "logprobs": None
+                }
+            ]
+        }
+        
+        if self.data["usage"]:
+            final_response["usage"] = self.data["usage"]
+        if self.data["system_fingerprint"]:
+            final_response["system_fingerprint"] = self.data["system_fingerprint"]
+        
+        return final_response
 
 # --- API Endpoints ---
 
@@ -91,22 +286,20 @@ async def chat_completions(
         client_wants_stream = request_body.get("stream", False)
         
         # 发送请求到CodeBuddy
-        import httpx
         
         if client_wants_stream:
-            # 流式响应：使用httpx.stream确保连接保持活跃
-            async def stream_response():
-                client = None
-                try:
-                    # 创建客户端连接，使用合适的超时设置
-                    client = httpx.AsyncClient(
-                        verify=False, 
-                        timeout=httpx.Timeout(300.0, connect=30.0, read=300.0)
-                    )
+            # 带重连机制的流式响应
+            async def stream_response_core():
+                """核心流式响应函数"""
+                # 使用标准的客户端配置和上下文管理
+                async with httpx.AsyncClient(
+                    verify=False,
+                    timeout=httpx.Timeout(300.0, connect=30.0, read=300.0)
+                ) as client:
                     
-                    # 使用stream方法确保连接在整个过程中保持活跃
+                    # 使用stream方法确保连接保持活跃
                     async with client.stream(
-                        "POST", 
+                        "POST",
                         "https://www.codebuddy.ai/v2/chat/completions",
                         json=payload,
                         headers=headers
@@ -116,89 +309,56 @@ async def chat_completions(
                             error_text = await response.aread()
                             error_msg = error_text.decode('utf-8', errors='ignore')
                             logger.error(f"CodeBuddy API错误: {response.status_code} - {error_msg}")
-                            error_data = {"error": f"CodeBuddy API error: {response.status_code} - {error_msg}"}
-                            error_chunk = f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
-                            yield error_chunk.encode('utf-8')
+                            yield format_sse_error(f"CodeBuddy API error: {response.status_code} - {error_msg}", "api_error")
                             return
                         
-                        chunk_count = 0
-                        total_bytes = 0
-                        done_found = False
-                        
-                        # 使用缓冲区逐行处理，确保SSE事件完整性
-                        buffer = b""
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            if chunk:
-                                chunk_count += 1
-                                total_bytes += len(chunk)
+                        # 简化的SSE处理：按行解析
+                        buffer = ""
+                        async for chunk in response.aiter_text(chunk_size=8192):
+                            if not chunk:
+                                continue
+                            
+                            buffer += chunk
+                            
+                            # 按行处理，确保SSE事件完整性
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
                                 
-                                # 将chunk添加到缓冲区
-                                buffer += chunk
+                                # 跳过空行和注释
+                                if not line.strip() or line.startswith(':'):
+                                    continue
                                 
-                                # 按行分割处理，确保SSE事件的完整性
-                                while b'\n' in buffer:
-                                    line, buffer = buffer.split(b'\n', 1)
-                                    line_with_newline = line + b'\n'
-                                    
-                                    # 立即转发完整的行给客户端
-                                    yield line_with_newline
-                                    
-                                    # 检查是否包含结束标记
-                                    if b'[DONE]' in line:
-                                        done_found = True
-                        
-                        # 处理缓冲区中剩余的数据（确保SSE事件完整性）
-                        if buffer:
-                            # 检查是否是完整的SSE事件
-                            buffer_str = buffer.decode('utf-8', errors='ignore')
-                            if buffer_str.strip():
-                                # 如果不是以换行符结尾，添加换行符确保SSE格式正确
-                                if not buffer_str.endswith('\n'):
-                                    buffer += b'\n'
-                                yield buffer
-                        
-                        if not done_found:
-                            logger.warning("[STREAM] 流结束但未发现[DONE]标记")
+                                # 直接转发完整的SSE行
+                                yield line + '\n'
                                 
-                except httpx.TimeoutException as e:
-                    logger.error(f"CodeBuddy API 超时: {e}")
-                    error_data = {"error": f"CodeBuddy API timeout: {str(e)}"}
-                    error_chunk = f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
-                    yield error_chunk.encode('utf-8')
-                except httpx.NetworkError as e:
-                    logger.error(f"网络错误: {e}")
-                    error_data = {"error": f"Network error: {str(e)}"}
-                    error_chunk = f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
-                    yield error_chunk.encode('utf-8')
-                except Exception as e:
-                    logger.error(f"流式响应错误: {e}", exc_info=True)
-                    error_data = {"error": f"Stream interrupted: {str(e)}"}
-                    error_chunk = f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
-                    yield error_chunk.encode('utf-8')
-                finally:
-                    # 确保客户端连接被正确关闭
-                    if client:
-                        await client.aclose()
+                                # 检查结束标记
+                                if '[DONE]' in line:
+                                    return
+                        
+                        # 处理缓冲区中剩余的数据
+                        if buffer.strip():
+                            yield buffer + '\n'
+            
+            # 使用重连管理器
+            connection_manager = SSEConnectionManager(max_retries=3, retry_delay=1.0)
+            
+            async def stream_response():
+                async for chunk in connection_manager.stream_with_retry(stream_response_core):
+                    yield chunk
             
             return StreamingResponse(
                 stream_response(),
                 media_type="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
+                    "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                    "Access-Control-Allow-Headers": "*",
-                    "Content-Type": "text/event-stream; charset=utf-8",
-                    "Transfer-Encoding": "chunked"
+                    "Access-Control-Allow-Headers": "*"
                 }
             )
         else:
-            # 客户端要求非流式，收集并合并所有流式响应块（真正透传）
-            # Rewritten: aggregate SSE chunks into a single non-stream response (minimal + complete)
+            # 简化的非流式响应聚合
             try:
                 async with httpx.AsyncClient(verify=False, timeout=300) as client:
                     response = await client.post(
@@ -215,151 +375,30 @@ async def chat_completions(
                             detail=f"CodeBuddy API error: {error_text}"
                         )
                     
-                    agg_id = None
-                    agg_model = None
-                    agg_content = ""
-                    # Maintain ordered list of tool calls + active mapping by index
-                    tool_calls: List[Dict[str, Any]] = []
-                    active_pos_by_index: Dict[int, int] = {}
-                    last_finish_reason = None
-                    last_usage = None
-                    last_system_fp = None
-                    saw_any = False
-
-                    # 使用缓冲区确保SSE事件完整性（非流式也需要）
-                    buffer = b""
-                    async for _chunk in response.aiter_bytes():
-                        if not _chunk:
+                    # 使用聚合器处理响应
+                    aggregator = StreamResponseAggregator()
+                    
+                    # 简化的SSE解析
+                    buffer = ""
+                    async for chunk in response.aiter_text():
+                        if not chunk:
                             continue
-                        buffer += _chunk
                         
-                        # 按行处理，确保完整的SSE事件
-                        while b'\n' in buffer:
-                            line_bytes, buffer = buffer.split(b'\n', 1)
-                            _line = line_bytes.decode('utf-8', errors='ignore')
+                        buffer += chunk
+                        
+                        # 按行处理SSE事件
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
                             
-                            if not _line.startswith('data: '):
-                                continue
-                            _data = _line[6:].strip()
-                            if not _data or _data == '[DONE]':
-                                continue
-                            try:
-                                _obj = json.loads(_data)
-                            except json.JSONDecodeError:
-                                continue
-
-                            saw_any = True
-                            agg_id = agg_id or _obj.get('id')
-                            agg_model = agg_model or _obj.get('model')
-                            last_system_fp = _obj.get('system_fingerprint') or last_system_fp
-                            if _obj.get('usage'):
-                                last_usage = _obj.get('usage')
-
-                            _choices = _obj.get('choices') or []
-                            if not _choices:
-                                continue
-                            _c0 = _choices[0]
-                            _fr = _c0.get('finish_reason')
-                            if _fr:
-                                last_finish_reason = _fr
-                            _delta = _c0.get('delta') or {}
-                            _text_piece = _delta.get('content')
-                            if _text_piece:
-                                agg_content += _text_piece
-                            _tc_list = _delta.get('tool_calls')
-                            if isinstance(_tc_list, list):
-                                for _tc in _tc_list:
-                                    if not isinstance(_tc, dict):
-                                        continue
-                                    _idx = _tc.get('index')
-                                    if _idx is None:
-                                        continue
-                                    _incoming_id = _tc.get('id')
-                                    _pos = active_pos_by_index.get(_idx)
-                                    # Start a new call when first seen for this index or id changes
-                                    if _pos is None or (_pos is not None and _incoming_id and _pos < len(tool_calls) and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
-                                        tool_calls.append({
-                                            'id': _incoming_id,
-                                            'type': _tc.get('type', 'function'),
-                                            'function': {'name': (_tc.get('function') or {}).get('name', ''), 'arguments': ''}
-                                        })
-                                        _pos = len(tool_calls) - 1
-                                        active_pos_by_index[_idx] = _pos
-                                    # Merge updates into active call
-                                    if _incoming_id and not tool_calls[_pos].get('id'):
-                                        tool_calls[_pos]['id'] = _incoming_id
-                                    if _tc.get('type'):
-                                        tool_calls[_pos]['type'] = _tc.get('type')
-                                    _func = _tc.get('function') or {}
-                                    _name = _func.get('name')
-                                    if _name:
-                                        tool_calls[_pos]['function']['name'] = _name
-                                    _args_piece = _func.get('arguments')
-                                    if _args_piece:
-                                        tool_calls[_pos]['function']['arguments'] += _args_piece
-
-                    # 处理缓冲区中剩余的最后一行数据（如果存在）
-                    if buffer:
-                        line_bytes = buffer
-                        _line = line_bytes.decode('utf-8', errors='ignore').strip()
-                        
-                        if _line.startswith('data: '):
-                            _data = _line[6:].strip()
-                            if _data and _data != '[DONE]':
-                                try:
-                                    _obj = json.loads(_data)
-                                    # 安全地处理最后一行数据，使用相同的逻辑
-                                    saw_any = True
-                                    agg_id = agg_id or _obj.get('id')
-                                    agg_model = agg_model or _obj.get('model')
-                                    last_system_fp = _obj.get('system_fingerprint') or last_system_fp
-                                    if _obj.get('usage'):
-                                        last_usage = _obj.get('usage')
-
-                                    _choices = _obj.get('choices') or []
-                                    if _choices:
-                                        _c0 = _choices[0]
-                                        _fr = _c0.get('finish_reason')
-                                        if _fr:
-                                            last_finish_reason = _fr
-                                        _delta = _c0.get('delta') or {}
-                                        _text_piece = _delta.get('content')
-                                        if _text_piece:
-                                            agg_content += _text_piece
-                                        # 处理工具调用（如果有）
-                                        _tc_list = _delta.get('tool_calls')
-                                        if isinstance(_tc_list, list):
-                                            for _tc in _tc_list:
-                                                if not isinstance(_tc, dict):
-                                                    continue
-                                                _idx = _tc.get('index')
-                                                if _idx is None:
-                                                    continue
-                                                _incoming_id = _tc.get('id')
-                                                _pos = active_pos_by_index.get(_idx)
-                                                if _pos is None or (_pos is not None and _incoming_id and _pos < len(tool_calls) and tool_calls[_pos].get('id') and tool_calls[_pos]['id'] != _incoming_id):
-                                                    tool_calls.append({
-                                                        'id': _incoming_id,
-                                                        'type': _tc.get('type', 'function'),
-                                                        'function': {'name': (_tc.get('function') or {}).get('name', ''), 'arguments': ''}
-                                                    })
-                                                    _pos = len(tool_calls) - 1
-                                                    active_pos_by_index[_idx] = _pos
-                                                if _pos < len(tool_calls):  # 安全检查
-                                                    if _incoming_id and not tool_calls[_pos].get('id'):
-                                                        tool_calls[_pos]['id'] = _incoming_id
-                                                    if _tc.get('type'):
-                                                        tool_calls[_pos]['type'] = _tc.get('type')
-                                                    _func = _tc.get('function') or {}
-                                                    _name = _func.get('name')
-                                                    if _name:
-                                                        tool_calls[_pos]['function']['name'] = _name
-                                                    _args_piece = _func.get('arguments')
-                                                    if _args_piece:
-                                                        tool_calls[_pos]['function']['arguments'] += _args_piece
-                                except json.JSONDecodeError:
-                                    # 静默忽略无效的JSON，避免破坏现有逻辑
-                                    pass
+                            obj = parse_sse_line(line)
+                            if obj:
+                                aggregator.process_chunk(obj)
+                    
+                    # 处理缓冲区剩余数据
+                    if buffer.strip():
+                        obj = parse_sse_line(buffer.strip())
+                        if obj:
+                            aggregator.process_chunk(obj)
 
             except httpx.TimeoutException:
                 logger.error("CodeBuddy API 超时")
@@ -371,62 +410,8 @@ async def chat_completions(
                 logger.error(f"请求异常: {e}")
                 raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
 
-            if not saw_any:
-                return {"error": "No valid response received from CodeBuddy", "details": "Stream ended without complete response"}
-
-            _final_message = {"role": "assistant", "content": agg_content}
-            if tool_calls:
-                _final_message["tool_calls"] = tool_calls
-            _finish_reason = "tool_calls" if tool_calls else (last_finish_reason or "stop")
-
-            # Validate and fix tool_calls.function.arguments JSON
-            if tool_calls:
-                for _i, _tc in enumerate(tool_calls):
-                    _func = _tc.get('function') or {}
-                    _args = _func.get('arguments', '')
-                    if isinstance(_args, str) and _args.strip():
-                        try:
-                            # 尝试解析JSON以验证格式
-                            json.loads(_args)
-                        except json.JSONDecodeError as _ve:
-                            # 如果JSON无效，尝试修复常见问题
-                            logger.warning(f"Tool call {_i} has invalid JSON arguments: {_ve}")
-                            
-                            # 尝试修复截断的JSON
-                            if not _args.endswith('}') and not _args.endswith(']'):
-                                if _args.count('{') > _args.count('}'):
-                                    _args += '}'
-                                elif _args.count('[') > _args.count(']'):
-                                    _args += ']'
-                            
-                            # 再次尝试解析
-                            try:
-                                json.loads(_args)
-                                _tc['function']['arguments'] = _args
-                                logger.info(f"Successfully fixed tool call {_i} JSON")
-                            except:
-                                # 如果仍然无法解析，使用空对象
-                                logger.error(f"Could not fix tool call {_i}, using empty args")
-                                _tc['function']['arguments'] = '{}'
-            _final_response = {
-                "id": agg_id or str(uuid.uuid4()),
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": agg_model or "unknown",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": _final_message,
-                        "finish_reason": _finish_reason,
-                        "logprobs": None
-                    }
-                ]
-            }
-            if last_usage:
-                _final_response["usage"] = last_usage
-            if last_system_fp:
-                _final_response["system_fingerprint"] = last_system_fp
-            return _final_response
+            # 返回聚合后的最终响应
+            return aggregator.finalize()
                 
     except HTTPException:
         raise
@@ -438,18 +423,10 @@ async def chat_completions(
 async def list_v1_models(_token: str = Depends(authenticate)):
     """获取CodeBuddy V1模型列表"""
     try:
-        # 此端点只返回静态模型列表，不需要消耗凭证
-        
         models = [
-            "claude-4.0",
-            "claude-3.7",
-            "gpt-5",
-            "gpt-5-mini",
-            "gpt-5-nano",
-            "o4-mini",
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-            "auto-chat"
+            "claude-4.0", "claude-3.7", "gpt-5", "gpt-5-mini",
+            "gpt-5-nano", "o4-mini", "gemini-2.5-flash",
+            "gemini-2.5-pro", "auto-chat"
         ]
         
         return {
@@ -473,50 +450,26 @@ async def list_credentials(_token: str = Depends(authenticate)):
         credentials_info = codebuddy_token_manager.get_credentials_info()
         safe_credentials = []
         
+        credentials = codebuddy_token_manager.get_all_credentials()
+        
         for info in credentials_info:
-            bearer_token = ""
-            # 从原始数据中获取token用于预览
-            credentials = codebuddy_token_manager.get_all_credentials()
-            if info['index'] < len(credentials):
-                bearer_token = credentials[info['index']].get("bearer_token", "")
+            bearer_token = credentials[info['index']].get("bearer_token", "") if info['index'] < len(credentials) else ""
             
             # 格式化时间显示
-            time_remaining_str = "Unknown"
-            if info['time_remaining'] is not None:
-                if info['time_remaining'] > 0:
-                    days = info['time_remaining'] // 86400
-                    hours = (info['time_remaining'] % 86400) // 3600
-                    minutes = (info['time_remaining'] % 3600) // 60
-                    if days > 0:
-                        time_remaining_str = f"{days}d {hours}h"
-                    elif hours > 0:
-                        time_remaining_str = f"{hours}h {minutes}m"
-                    else:
-                        time_remaining_str = f"{minutes}m"
-                else:
-                    time_remaining_str = "Expired"
+            if info['time_remaining'] is not None and info['time_remaining'] > 0:
+                days, remainder = divmod(info['time_remaining'], 86400)
+                hours, remainder = divmod(remainder, 3600)
+                minutes = remainder // 60
+                time_remaining_str = f"{days}d {hours}h" if days > 0 else f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+            else:
+                time_remaining_str = "Expired" if info['time_remaining'] is not None else "Unknown"
             
-            safe_cred = {
-                "index": info['index'],
-                "filename": info['filename'],
-                "user_id": info['user_id'],
-                "email": info['email'],
-                "name": info['name'],
-                "created_at": info['created_at'],
-                "expires_in": info['expires_in'],
-                "expires_at": info['expires_at'],
-                "time_remaining": info['time_remaining'],
+            safe_credentials.append({
+                **info,  # 展开所有原始信息
                 "time_remaining_str": time_remaining_str,
-                "is_expired": info['is_expired'],
-                "token_type": info['token_type'],
-                "scope": info['scope'],
-                "domain": info['domain'],
-                "has_refresh_token": info['has_refresh_token'],
-                "session_state": info['session_state'],
                 "has_token": bool(bearer_token),
-                "token_preview": f"{bearer_token[:10]}...{bearer_token[-4:]}" if bearer_token and len(bearer_token) > 14 else "Invalid Token"
-            }
-            safe_credentials.append(safe_cred)
+                "token_preview": f"{bearer_token[:10]}...{bearer_token[-4:]}" if len(bearer_token) > 14 else "Invalid Token"
+            })
         
         return {"credentials": safe_credentials}
         
@@ -533,14 +486,14 @@ async def add_credential(
     """添加一个新的认证凭证"""
     try:
         data = await request.json()
-        bearer_token = data.get("bearer_token")
-        user_id = data.get("user_id")
-        filename = data.get("filename")
-
-        if not bearer_token:
+        if not data.get("bearer_token"):
             raise HTTPException(status_code=422, detail="bearer_token is required")
 
-        success = codebuddy_token_manager.add_credential(bearer_token, user_id, filename)
+        success = codebuddy_token_manager.add_credential(
+            data.get("bearer_token"),
+            data.get("user_id"),
+            data.get("filename")
+        )
         if not success:
             raise HTTPException(status_code=500, detail="Failed to save credential file")
         
@@ -560,12 +513,10 @@ async def select_credential(
     try:
         data = await request.json()
         index = data.get("index")
-
         if index is None:
             raise HTTPException(status_code=422, detail="index is required")
 
-        success = codebuddy_token_manager.set_manual_credential(index)
-        if not success:
+        if not codebuddy_token_manager.set_manual_credential(index):
             raise HTTPException(status_code=400, detail="Invalid credential index")
         
         return {"message": f"Credential #{index + 1} selected successfully"}
@@ -622,15 +573,10 @@ async def delete_credential(request: Request, _token: str = Depends(authenticate
     try:
         data = await request.json()
         index = data.get("index")
+        if index is None or not isinstance(index, int):
+            raise HTTPException(status_code=422, detail="Valid integer index is required")
 
-        if index is None:
-            raise HTTPException(status_code=422, detail="index is required")
-
-        if not isinstance(index, int):
-            raise HTTPException(status_code=422, detail="index must be an integer")
-
-        success = codebuddy_token_manager.delete_credential_by_index(index)
-        if not success:
+        if not codebuddy_token_manager.delete_credential_by_index(index):
             raise HTTPException(status_code=400, detail="Invalid index or failed to delete credential")
 
         return {"message": f"Credential #{index + 1} deleted successfully"}
