@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # Import the routers
-from src.codebuddy_router import router as codebuddy_router
+from src.codebuddy_router import router as codebuddy_router, lifecycle_manager
 from src.codebuddy_auth_router import router as codebuddy_auth_router
 from src.settings_router import router as settings_router
 from src.frontend_router import router as frontend_router
@@ -28,8 +28,14 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     logger.info("Starting CodeBuddy2API Service")
-    yield
-    logger.info("CodeBuddy2API Service stopped")
+    try:
+        # 启动时初始化资源
+        await lifecycle_manager.startup()
+        yield
+    finally:
+        # 关闭时清理资源
+        await lifecycle_manager.shutdown()
+        logger.info("CodeBuddy2API Service stopped")
 
 
 # 创建FastAPI应用
