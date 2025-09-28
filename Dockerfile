@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 RUN mkdir -p /app/config
+RUN mkdir -p /app/.codebuddy_creds
 
 
 # 安装 gosu，一个轻量级的 su/sudo 替代品，用于在脚本中切换用户
