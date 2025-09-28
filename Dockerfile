@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 将项目的所有文件复制到工作目录中
 COPY . .
 
+RUN mkdir -p /app/config
+
+
 # 安装 gosu，一个轻量级的 su/sudo 替代品，用于在脚本中切换用户
 # 并在同一层中进行清理以减小镜像体积
 RUN apt-get update && \
